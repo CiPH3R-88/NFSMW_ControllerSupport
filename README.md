@@ -47,7 +47,7 @@ Adds full native gamepad support, high-resolution Xbox and PlayStation button gl
 
 ## Installation
 
-1. Copy `NFSMW_ControllerSupport.asi`, `NFSMW_ControllerSupport.ini`, and `NFSMW_ControllerSupport.bin` into your game's `scripts/` folder (requires an ASI Loader - [`dinput8.dll`](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases)).
+1. Copy `NFSMW_ControllerSupport.asi`, `NFSMW_ControllerSupport.ini` into your game's `scripts/` and `NFSMW_ControllerSupport.bin` into your game's `global/` folder (requires an ASI Loader - [`dinput8.dll`](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases)).
 2. Configure settings inside `NFSMW_ControllerSupport.ini` to your preference.
 
 > [!NOTE]
