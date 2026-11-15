@@ -51,7 +51,7 @@ Adds full native gamepad support, high-resolution Xbox and PlayStation button gl
 2. Configure settings inside `NFSMW_ControllerSupport.ini` to your preference.
 
 > [!NOTE]
-> `NFSMW_ControllerSupport.bin` must be placed in the same folder as `NFSMW_ControllerSupport.asi` (or the game root) to load the button icons.
+> `NFSMW_ControllerSupport.bin` must be placed in the Global folder to load the button icons.
 
 ---
 
