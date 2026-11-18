@@ -53,10 +53,14 @@ namespace ControllerSupport {
     inline std::filesystem::path s_GamePath;
 
     inline WNDPROC s_OrigWndProc = nullptr;
+    inline bool s_DeviceChangePending = false;
 
     inline LRESULT CALLBACK Hook_WndProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam) {
         if (Msg == WM_KEYDOWN || Msg == WM_SYSKEYDOWN || Msg == WM_LBUTTONDOWN || Msg == WM_RBUTTONDOWN) {
             s_LastInputWasPad = false;
+        }
+        if (Msg == WM_DEVICECHANGE) {
+            s_DeviceChangePending = true;
         }
         return s_OrigWndProc ? CallWindowProcA(s_OrigWndProc, hWnd, Msg, wParam, lParam)
             : DefWindowProcA(hWnd, Msg, wParam, lParam);
@@ -164,35 +168,19 @@ namespace ControllerSupport {
     // Check if the physical DirectInput device is currently attached to the system
     inline bool IsJoypadAttached(uintptr_t pJoypad, bool force = false) {
         if (!pJoypad || pJoypad == static_cast<uintptr_t>(-4)) return false;
-
-        static DWORD s_LastCheckTick = 0;
-        static bool s_CachedAttached = true;
-        DWORD now = GetTickCount();
-        if (!force && (now - s_LastCheckTick < 250)) {
-            return s_CachedAttached;
-        }
-        s_LastCheckTick = now;
+        if (!force) return true; // Zero-overhead in-memory check during active gameplay
 
         void* pDevice = *reinterpret_cast<void**>(pJoypad + 1128);
-        if (!pDevice) {
-            s_CachedAttached = false;
-            return false;
-        }
+        if (!pDevice) return false;
 
         void** devVtbl = *reinterpret_cast<void***>(pDevice);
-        if (!devVtbl || !devVtbl[15]) {
-            s_CachedAttached = false;
-            return false;
-        }
+        if (!devVtbl || !devVtbl[15]) return false;
 
         DI_DeviceInstanceA di = {};
         di.dwSize = sizeof(DI_DeviceInstanceA);
         using GetDeviceInfoFn = HRESULT(__stdcall*)(void*, DI_DeviceInstanceA*);
         auto getDevInfo = reinterpret_cast<GetDeviceInfoFn>(devVtbl[15]);
-        if (getDevInfo(pDevice, &di) < 0) {
-            s_CachedAttached = false;
-            return false;
-        }
+        if (getDevInfo(pDevice, &di) < 0) return false;
 
         uintptr_t* pDInputSys = *reinterpret_cast<uintptr_t**>(0x009BB410);
         if (pDInputSys) {
@@ -204,26 +192,17 @@ namespace ControllerSupport {
                     auto getDeviceStatus = reinterpret_cast<GetDeviceStatusFn>(dinputVtbl[5]);
                     HRESULT hrStatus = getDeviceStatus(pDInput, &di.guidInstance);
                     if (hrStatus != 0) { // DI_OK is 0; DIERR_NOTATTACHED is 0x800401E3
-                        s_CachedAttached = false;
                         return false;
                     }
                 }
             }
         }
 
-        if (devVtbl[25]) { // Poll
-            using PollFn = HRESULT(__stdcall*)(void*);
-            auto poll = reinterpret_cast<PollFn>(devVtbl[25]);
-            HRESULT hrPoll = poll(pDevice);
-            if (hrPoll == static_cast<HRESULT>(0x800401E3L) /* DIERR_UNPLUGGED */) {
-                s_CachedAttached = false;
-                return false;
-            }
-        }
-
-        s_CachedAttached = true;
         return true;
     }
+
+    inline uintptr_t s_LastJoypadPtr = 0;
+    inline int s_CachedControllerType = 0;
 
     inline void HandleControllerDisconnected() {
         *reinterpret_cast<uintptr_t*>(ADDR_JOYPAD_PTR) = 0;
@@ -232,46 +211,43 @@ namespace ControllerSupport {
         *reinterpret_cast<int32_t*>(ADDR_BUTTONS_STATE + 0x13C) = 0;
         *reinterpret_cast<int32_t*>(ADDR_BUTTONS_STATE + 0xB0) = 0;
         s_LastDetectedType = 0;
+        s_CachedControllerType = 0;
+        s_LastJoypadPtr = 0;
         s_UserForcedMode = -1; // Reset manual override back to auto (OFF)
         s_LastInputWasPad = false; // Switch icons back to PC / Keyboard
         MemoryTools::Write<uint32_t>(ADDR_START_TEXT_HASH, HASH_START_PROMPT_XBOX);
     }
 
-    // Dynamically scan for newly connected gamepads if none was detected at engine boot
+    // Dynamically scan for newly connected gamepads when triggered
     inline void TryHotplugController(bool force = false) {
         uintptr_t currentPad = *reinterpret_cast<uintptr_t*>(ADDR_JOYPAD_PTR);
         if (currentPad != 0 && currentPad != static_cast<uintptr_t>(-4)) {
-            if (IsJoypadAttached(currentPad, force)) {
-                static bool s_InitialBindsSaved = false;
-                if (!s_InitialBindsSaved) {
-                    bool hasBinds = false;
-                    for (int i = 0; i < 19; ++i) {
-                        uintptr_t pAction = 0x0091F418 + (i * 52);
-                        int inputType = *reinterpret_cast<int*>(pAction + 28);
-                        if (inputType > 0) {
-                            hasBinds = true;
-                            break;
-                        }
-                    }
-                    if (hasBinds) {
-                        s_InitialBindsSaved = true;
-                        std::filesystem::path path = GetBindsFilePath();
-                        if (!std::filesystem::exists(path)) {
-                            SaveControllerBindings();
-                        }
+            static bool s_InitialBindsSaved = false;
+            if (!s_InitialBindsSaved) {
+                bool hasBinds = false;
+                for (int i = 0; i < 19; ++i) {
+                    uintptr_t pAction = 0x0091F418 + (i * 52);
+                    int inputType = *reinterpret_cast<int*>(pAction + 28);
+                    if (inputType > 0) {
+                        hasBinds = true;
+                        break;
                     }
                 }
-                return;
+                if (hasBinds) {
+                    s_InitialBindsSaved = true;
+                    std::filesystem::path path = GetBindsFilePath();
+                    if (!std::filesystem::exists(path)) {
+                        SaveControllerBindings();
+                    }
+                }
             }
-            HandleControllerDisconnected();
+            return;
         }
 
-        static DWORD s_LastScanTick = 0;
-        DWORD now = GetTickCount();
-        if (!force && (now - s_LastScanTick < 1000)) {
-            return; // Rate limit automatic scanning to once per second
+        // Only scan when forced (e.g. WM_DEVICECHANGE, menu navigation, or user toggle)
+        if (!force) {
+            return;
         }
-        s_LastScanTick = now;
 
         uintptr_t* pDInputSys = *reinterpret_cast<uintptr_t**>(0x009BB410);
         if (!pDInputSys) return;
@@ -297,6 +273,7 @@ namespace ControllerSupport {
 
         uintptr_t newPad = *reinterpret_cast<uintptr_t*>(ADDR_JOYPAD_PTR);
         if (newPad && newPad != static_cast<uintptr_t>(-4)) {
+            s_LastJoypadPtr = 0;
             // 1. DirectInput vs XInput caps check
             reinterpret_cast<void(__cdecl*)()>(0x006282E0)();
 
@@ -346,18 +323,17 @@ namespace ControllerSupport {
     inline int DetectConnectedControllerType() {
         uintptr_t pJoypad = *reinterpret_cast<uintptr_t*>(ADDR_JOYPAD_PTR);
         if (!pJoypad || pJoypad == static_cast<uintptr_t>(-4)) {
-            TryHotplugController(false);
-            pJoypad = *reinterpret_cast<uintptr_t*>(ADDR_JOYPAD_PTR);
-            if (!pJoypad || pJoypad == static_cast<uintptr_t>(-4)) {
-                return 0; // No controller connected -> OFF
-            }
+            s_LastJoypadPtr = 0;
+            s_CachedControllerType = 0;
+            return 0; // No controller connected -> OFF
         }
 
-        // Verify that the registered joypad is still physically attached to the system
-        if (!IsJoypadAttached(pJoypad)) {
-            HandleControllerDisconnected();
-            return 0; // Unplugged -> OFF
+        // Return cached detection if joypad instance hasn't changed
+        if (pJoypad == s_LastJoypadPtr && s_CachedControllerType != 0) {
+            return s_CachedControllerType;
         }
+
+        s_LastJoypadPtr = pJoypad;
 
         auto isPlayStationMatch = [](const char* str) -> bool {
             if (!str || !*str) return false;
@@ -391,20 +367,17 @@ namespace ControllerSupport {
                 if (getDevInfo(pDevice, &di) >= 0) {
                     uint16_t vid = static_cast<uint16_t>(di.guidProduct.Data1 & 0xFFFF);
                     if (vid == 0x054C) { // Sony Interactive Entertainment
+                        s_CachedControllerType = 2;
                         return 2; // PLAYSTATION
                     }
                     if (vid == 0x045E) { // Microsoft
+                        s_CachedControllerType = 1;
                         return 1; // XBOX
                     }
                     if (isPlayStationMatch(di.tszProductName) || isPlayStationMatch(di.tszInstanceName)) {
+                        s_CachedControllerType = 2;
                         return 2; // PLAYSTATION
                     }
-                }
-                else {
-                    // Device communication failed (e.g. unplugged)
-                    *reinterpret_cast<uintptr_t*>(ADDR_JOYPAD_PTR) = 0;
-                    *reinterpret_cast<int*>(0x009203B8) = 0;
-                    return 0;
                 }
             }
         }
@@ -414,10 +387,12 @@ namespace ControllerSupport {
         const char* instName = reinterpret_cast<const char*>(pJoypad + 16);  // tszInstanceName
 
         if (isPlayStationMatch(prodName) || isPlayStationMatch(instName)) {
+            s_CachedControllerType = 2;
             return 2; // PLAYSTATION
         }
 
         // Default connected gamepads to Xbox (PC standard)
+        s_CachedControllerType = 1;
         return 1; // XBOX
     }
 
@@ -440,19 +415,26 @@ namespace ControllerSupport {
     }
 
     // Checks whether gamepad input is currently permitted:
-    // Requires effective mode > 0 (not OFF) AND the selected mode matches the physically connected hardware type.
+    // Requires effective mode > 0 (not OFF) AND joypad is present.
     inline bool IsControllerAllowed() {
+        uintptr_t pJoypad = *reinterpret_cast<uintptr_t*>(ADDR_JOYPAD_PTR);
+        if (!pJoypad || pJoypad == static_cast<uintptr_t>(-4)) {
+            return false;
+        }
         int effMode = GetEffectiveMode();
         if (effMode <= 0) {
             return false;
         }
-        int physicalType = DetectConnectedControllerType();
-        return physicalType == effMode;
+        if (s_ControllerSupportMode == 3) {
+            int physicalType = DetectConnectedControllerType();
+            return physicalType == effMode;
+        }
+        return true;
     }
 
     // Master hook for sub_628C50: Suppresses controller bind tab in controls menu when controller is disabled, mismatched, or unplugged
     inline BOOL __cdecl Hooked_sub_628C50() {
-        TryHotplugController(false);
+        TryHotplugController(true);
         uintptr_t currentPad = *reinterpret_cast<uintptr_t*>(ADDR_JOYPAD_PTR);
         if (!currentPad || currentPad == static_cast<uintptr_t>(-4) || !IsJoypadAttached(currentPad, true)) {
             HandleControllerDisconnected();
@@ -623,6 +605,11 @@ namespace ControllerSupport {
     inline void UpdateActivePackages(void* pFEng) {
         if (!pFEng) return;
         EnsureCustomTexturesLoaded();
+
+        if (s_DeviceChangePending) {
+            s_DeviceChangePending = false;
+            TryHotplugController(true);
+        }
 
         FEObjectCallbackStruct callback = { nullptr, reinterpret_cast<void*>(&Callback_FEObjectVisitor) };
         void* cbpointer = &callback;
@@ -989,7 +976,7 @@ namespace ControllerSupport {
     inline void UpdateControllerToggleLabel(void* widget) {
         if (!widget) return;
 
-        TryHotplugController(false);
+        TryHotplugController(true);
         uintptr_t currentPad = *reinterpret_cast<uintptr_t*>(ADDR_JOYPAD_PTR);
         if (currentPad && currentPad != static_cast<uintptr_t>(-4) && !IsJoypadAttached(currentPad, true)) {
             HandleControllerDisconnected();
